@@ -12,8 +12,8 @@ the script here directly.
 ## Install
 
 ```sh
-gh api repos/williamacallahan/claude-any-llm/contents/claude-any-llm \
-  -H "Accept: application/vnd.github.raw" > ~/.local/bin/claude-any-llm
+curl -fsSL -o ~/.local/bin/claude-any-llm \
+  https://raw.githubusercontent.com/williamacallahan/claude-any-llm/main/claude-any-llm
 chmod +x ~/.local/bin/claude-any-llm
 ```
 
