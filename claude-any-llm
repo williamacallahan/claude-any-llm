@@ -1,0 +1,421 @@
+#!/bin/sh
+# Launch Claude Code against the development gateway's opt-in compatibility catalog.
+
+name=$(basename "$0")
+base_url="${ANTHROPIC_BASE_URL:-https://dev.api.llm-gateway.iocloudhost.net}"
+default_model=stealth/ox-alpha
+requested_model="${ANTHROPIC_MODEL:-}"
+# The credential re-exec below re-enters this script with ANTHROPIC_MODEL
+# already exported. Without this marker that second pass cannot tell a
+# settings.json-derived id from an explicit one, so it skips the default-model
+# fallback and hard-fails on any settings model the gateway does not publish.
+requested_from_settings=false
+if [ -n "$requested_model" ] && [ -n "${CLAUDE_LLM_MODEL_FROM_SETTINGS:-}" ]; then
+  requested_from_settings=true
+fi
+key_secret=LLM_GATEWAY_DEV_API_KEY
+launcher_state_dir="$HOME/.config/claude-llm"
+launcher_model_file="$launcher_state_dir/$name.model"
+claude_settings="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json"
+
+# /model persists the chosen id in Claude's SHARED user settings, which breaks
+# plain `claude` against api.anthropic.com. The post-exit scrub below moves
+# gateway ids into $launcher_model_file, so launcher continuity reads that
+# launcher-owned state first; a settings.json gateway id is pre-scrub residue
+# and still honored here for one launch before the scrub migrates it.
+if [ -z "$requested_model" ] && [ -f "$launcher_model_file" ]; then
+  IFS= read -r requested_model < "$launcher_model_file" || :
+  [ -z "$requested_model" ] || requested_from_settings=true
+fi
+if [ -z "$requested_model" ] && [ -f "$claude_settings" ]; then
+  requested_model=$(jq -er '.model | strings | select(length > 0)' "$claude_settings" 2>/dev/null) ||
+    requested_model=
+  [ -z "$requested_model" ] || requested_from_settings=true
+fi
+requested_model="${requested_model:-$default_model}"
+
+# Rotate every non-launcher argument behind a unique boundary marker. This lets
+# the launcher recognize its model option anywhere before `--` without
+# lossy string reconstruction of Claude Code arguments.
+model_option_seen=false
+model_argument_boundary="__claude_any_llm_boundary_$$"
+while :; do
+  model_argument_boundary_conflict=false
+  for argument in "$@"; do
+    if [ "$argument" = "$model_argument_boundary" ]; then
+      model_argument_boundary_conflict=true
+      break
+    fi
+  done
+  [ "$model_argument_boundary_conflict" = false ] && break
+  model_argument_boundary="${model_argument_boundary}_"
+done
+
+set -- "$@" "$model_argument_boundary"
+while [ "$1" != "$model_argument_boundary" ]; do
+  case "$1" in
+    -m|--model)
+      [ "$model_option_seen" = false ] || {
+        echo "$name: -m/--model may be specified only once" >&2
+        exit 64
+      }
+      model_option_seen=true
+      requested_from_settings=false
+      model_option=$1
+      shift
+      if [ "$1" = "$model_argument_boundary" ] || [ -z "$1" ] ||
+        [ "${1#-}" != "$1" ]; then
+        echo "$name: $model_option needs a value" >&2
+        exit 64
+      fi
+      requested_model=$1
+      shift
+      ;;
+    -m=*|--model=*)
+      [ "$model_option_seen" = false ] || {
+        echo "$name: -m/--model may be specified only once" >&2
+        exit 64
+      }
+      model_option_seen=true
+      requested_from_settings=false
+      requested_model=${1#*=}
+      if [ -z "$requested_model" ]; then
+        echo "$name: $1 needs a value" >&2
+        exit 64
+      fi
+      shift
+      ;;
+    --)
+      argument=$1
+      shift
+      set -- "$@" "$argument"
+      while [ "$1" != "$model_argument_boundary" ]; do
+        argument=$1
+        shift
+        set -- "$@" "$argument"
+      done
+      ;;
+    *)
+      argument=$1
+      shift
+      set -- "$@" "$argument"
+      ;;
+  esac
+done
+shift
+
+export ANTHROPIC_BASE_URL="${base_url%/}"
+# Preserve the requested model across the one credential-injection re-exec.
+export ANTHROPIC_MODEL="$requested_model"
+export CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1
+
+# Managed clients wait longer than Claude Code's 10-minute SDK default while
+# retaining a finite 30-minute inter-chunk idle guard. API_FORCE_IDLE_TIMEOUT=0
+# disables Bun's separate five-minute custom-base-url idle cap. Caller values
+# remain authoritative.
+: "${API_TIMEOUT_MS:=3000000}"
+: "${API_FORCE_IDLE_TIMEOUT:=0}"
+: "${CLAUDE_STREAM_IDLE_TIMEOUT_MS:=1800000}"
+export API_TIMEOUT_MS API_FORCE_IDLE_TIMEOUT CLAUDE_STREAM_IDLE_TIMEOUT_MS
+
+# Ignore model slots inherited from another Claude launcher. The selected
+# compatibility ID is the only model this launcher chooses.
+unset ANTHROPIC_DEFAULT_HAIKU_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL
+unset ANTHROPIC_DEFAULT_OPUS_MODEL ANTHROPIC_SMALL_FAST_MODEL
+
+# Credentials are selective: existing Anthropic credentials, an optional
+# launcher env file, or exactly one Doppler personal/dev secret.
+env_file="${CLAUDE_LLM_ENV_FILE:-$HOME/.config/claude-llm/$name.env}"
+if [ -z "${ANTHROPIC_AUTH_TOKEN:-}" ] && [ -z "${ANTHROPIC_API_KEY:-}" ] &&
+  [ -f "$env_file" ]; then
+  set -a
+  . "$env_file"
+  set +a
+fi
+if [ -z "${ANTHROPIC_AUTH_TOKEN:-}" ] && [ -z "${ANTHROPIC_API_KEY:-}" ]; then
+  export CLAUDE_LLM_KEY_SECRET="$key_secret"
+  if [ "$requested_from_settings" = true ]; then
+    export CLAUDE_LLM_MODEL_FROM_SETTINGS=1
+  else
+    unset CLAUDE_LLM_MODEL_FROM_SETTINGS
+  fi
+  exec doppler run --no-fallback -p personal -c dev --only-secrets "$key_secret" -- sh -c '
+    eval "ANTHROPIC_AUTH_TOKEN=\"\${$CLAUDE_LLM_KEY_SECRET:?not in Doppler personal/dev}\""
+    export ANTHROPIC_AUTH_TOKEN
+    exec "$0" "$@"
+  ' "$0" "$@"
+fi
+if [ -z "${ANTHROPIC_AUTH_TOKEN:-}" ] && [ -z "${ANTHROPIC_API_KEY:-}" ]; then
+  echo "$name: no API key found. Export ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY," >&2
+  echo "  create $env_file, or provide $key_secret in Doppler personal/dev." >&2
+  exit 64
+fi
+
+usage_key="claude-any-llm:$(uuidgen | tr '[:upper:]' '[:lower:]')"
+for reserved_header in x-lgw-cache-key x-lgw-claude-code-catalog; do
+  if printf '%s\n' "${ANTHROPIC_CUSTOM_HEADERS:-}" |
+    grep -qi "^[[:space:]]*$reserved_header[[:space:]]*:"; then
+    echo "$name: ANTHROPIC_CUSTOM_HEADERS already sets $reserved_header" >&2
+    exit 64
+  fi
+done
+if [ -n "${ANTHROPIC_CUSTOM_HEADERS:-}" ]; then
+  ANTHROPIC_CUSTOM_HEADERS="$ANTHROPIC_CUSTOM_HEADERS
+X-LGW-Cache-Key: $usage_key
+X-LGW-Claude-Code-Catalog: 1"
+else
+  ANTHROPIC_CUSTOM_HEADERS="X-LGW-Cache-Key: $usage_key
+X-LGW-Claude-Code-Catalog: 1"
+fi
+if ! printf '%s\n' "${ANTHROPIC_CUSTOM_HEADERS:-}" |
+  grep -qi '^[[:space:]]*x-lgw-first-byte-budget-s[[:space:]]*:'; then
+  ANTHROPIC_CUSTOM_HEADERS="$ANTHROPIC_CUSTOM_HEADERS
+X-LGW-First-Byte-Budget-S: ${CLAUDE_LLM_FIRST_BYTE_BUDGET_S:-1500}"
+fi
+export ANTHROPIC_CUSTOM_HEADERS
+
+# Credentials travel through curl's stdin config, never its argv. Supplying an
+# Anthropic version asks the shared /v1/models route for its Anthropic shape.
+if [ -n "${ANTHROPIC_AUTH_TOKEN:-}" ]; then
+  auth_header=$(printf 'authorization: Bearer %s' "$ANTHROPIC_AUTH_TOKEN" | jq -Rsr '@json')
+else
+  auth_header=$(printf 'x-api-key: %s' "$ANTHROPIC_API_KEY" | jq -Rsr '@json')
+fi
+catalog=$(
+  {
+    printf 'header = %s\n' "$auth_header"
+    printf '%s\n' 'header = "anthropic-version: 2023-06-01"'
+    printf '%s\n' 'header = "X-LGW-Claude-Code-Catalog: 1"'
+    printf '%s\n' 'header = "accept: application/json"'
+  } | curl --silent --show-error --fail --max-time 10 --config - \
+    "$ANTHROPIC_BASE_URL/v1/models?limit=1000"
+) || {
+  echo "$name: gateway compatibility catalog unavailable" >&2
+  exit 69
+}
+
+rows=$(printf '%s\n' "$catalog" | jq -ce '
+  def valid_id:
+    type == "string"
+    and length > 0
+    and (explode | all(. >= 32 and . != 127));
+  if (.data | type) != "array"
+    or (all(.data[]; (.id | valid_id) and (.canonical_id | valid_id)) | not)
+    or ([.data[].id] | unique | length) != (.data | length)
+    or ([.data[].canonical_id] | unique | length) != (.data | length)
+  then error("malformed compatibility catalog")
+  else .data
+  end
+' 2>/dev/null) || {
+  echo "$name: gateway returned a malformed compatibility catalog" >&2
+  exit 65
+}
+
+selected=$(printf '%s\n' "$rows" | jq -ce --arg model "$requested_model" '
+  [.[] | select(.id == $model or .canonical_id == $model)]
+  | if length == 1 then .[0] else error("model missing or ambiguous") end
+' 2>/dev/null)
+if [ -z "${selected:-}" ] && [ "$requested_from_settings" = true ]; then
+  requested_model=$default_model
+  selected=$(printf '%s\n' "$rows" | jq -ce --arg model "$requested_model" '
+    [.[] | select(.id == $model or .canonical_id == $model)]
+    | if length == 1 then .[0] else error("default model missing or ambiguous") end
+  ' 2>/dev/null)
+fi
+if [ -z "${selected:-}" ]; then
+  echo "$name: model '$requested_model' is not in the gateway compatibility catalog" >&2
+  exit 65
+fi
+
+selected_id=$(printf '%s\n' "$selected" | jq -r '.id')
+selected_limits=$(printf '%s\n' "$selected" | jq -r '
+  def integer_or_zero:
+    if type == "number" and . > 0 and floor == . then . else 0 end;
+  "\(.max_input_tokens | integer_or_zero) \(.max_tokens | integer_or_zero) \(.max_serving_input_tokens | integer_or_zero)"
+')
+context_tokens=${selected_limits%% *}
+limits_rest=${selected_limits#* }
+output_tokens=${limits_rest%% *}
+serving_cap=${limits_rest#* }
+
+summary=$(printf '%s\n' "$selected" | jq -er '
+  def positive_integer:
+    type == "number" and . > 0 and floor == .;
+  def safe_scalar:
+    (type == "string" or type == "number")
+    and (tostring | explode | all(. >= 32 and . != 127));
+  . as $row
+  | (if ($row.pricing | type) == "object" then $row.pricing else {} end) as $pricing
+  | (if ($row.capabilities | type) == "object" then $row.capabilities else {} end) as $caps
+  | [
+      "selected \($row.canonical_id)",
+      "context \(if ($row.max_input_tokens | positive_integer) then $row.max_input_tokens else "unknown" end)",
+      "output \(if ($row.max_tokens | positive_integer) then $row.max_tokens else "unknown" end)",
+      "serving input \(if ($row.max_serving_input_tokens | positive_integer) then $row.max_serving_input_tokens else "unknown" end)"
+    ]
+    + ([
+        {key: "prompt", label: "input"},
+        {key: "completion", label: "output"},
+        {key: "input_cache_read", label: "cache read"},
+        {key: "input_cache_write", label: "cache write"},
+        {key: "input_cache_write_5m", label: "cache write 5m"},
+        {key: "input_cache_write_1h", label: "cache write 1h"}
+      ]
+      | map(. as $field | $pricing[$field.key] as $value
+          | select($value | safe_scalar)
+          | "\($field.label) $\($value)/token"))
+    + ((if ($caps.effort | type) == "object" then $caps.effort else {} end)
+      | [to_entries[]
+          | select(.key != "supported" and .value.supported == true)
+          | .key
+          | select(explode | all(. >= 32 and . != 127))]
+      | if length > 0 then ["reasoning \(join("/"))"] else [] end)
+    + ($caps
+      | [to_entries[]
+          | select(.key != "effort" and .key != "thinking")
+          | select(.value.supported == true)
+          | .key
+          | select(explode | all(. >= 32 and . != 127))]
+      | if length > 0 then ["capabilities \(join(","))"] else [] end)
+  | join(" · ")
+') || {
+  echo "$name: selected catalog row is malformed" >&2
+  exit 65
+}
+printf '%s: %s\n' "$name" "$summary" >&2
+printf '%s\n' \
+  "$name: in-session /model switches keep the startup-scoped numeric window; relaunch for exact context (Claude Code limit)." >&2
+printf '%s\n' \
+  "$name: Claude /usage is a client estimate; gateway actual is printed on exit." >&2
+
+# Inline CLI settings outrank user settings for a trustworthy published
+# context. Missing or malformed context keeps Claude Code's conservative
+# unknown-model enforcement and does not invent a window.
+unset CLAUDE_CODE_MAX_CONTEXT_TOKENS
+unset CLAUDE_CODE_AUTO_COMPACT_WINDOW
+unset CLAUDE_CODE_MAX_OUTPUT_TOKENS
+unset CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT
+if [ "$context_tokens" -gt 0 ] && [ "$output_tokens" -gt 0 ] && [ "$serving_cap" -gt 0 ]; then
+  output_reservation=$output_tokens
+  [ "$output_reservation" -le 20000 ] || output_reservation=20000
+  max_context_tokens=$((serving_cap + output_reservation + 3000))
+  auto_compact_tokens=$((serving_cap + output_reservation - 7000))
+  if [ "$auto_compact_tokens" -lt 100000 ]; then
+    echo "$name: model '$requested_model' leaves only $auto_compact_tokens tokens for auto-compaction" >&2
+    echo "$name: Claude Code ignores compact windows below 100000; refusing an unsafe launch" >&2
+    exit 65
+  fi
+  unset DISABLE_COMPACT DISABLE_AUTO_COMPACT CLAUDE_AUTOCOMPACT_PCT_OVERRIDE
+  settings=$(jq -cn \
+    --arg max_context "$max_context_tokens" \
+    --arg auto_compact "$auto_compact_tokens" \
+    --arg max_output "$output_tokens" '{
+    autoCompactEnabled: true,
+    env: {
+    CLAUDE_CODE_MAX_CONTEXT_TOKENS: $max_context,
+    CLAUDE_CODE_AUTO_COMPACT_WINDOW: $auto_compact,
+    CLAUDE_CODE_MAX_OUTPUT_TOKENS: $max_output,
+    DISABLE_COMPACT: "",
+    DISABLE_AUTO_COMPACT: "",
+    CLAUDE_AUTOCOMPACT_PCT_OVERRIDE: ""
+  }}')
+else
+  settings='{"env":{}}'
+fi
+
+export ANTHROPIC_MODEL="$selected_id"
+unset CLAUDE_LLM_MODEL_FROM_SETTINGS
+
+gateway_catalog_model() {
+  printf '%s\n' "$rows" | jq -e --arg model "$1" \
+    'any(.[]; .id == $model or .canonical_id == $model)' >/dev/null 2>&1
+}
+
+# In-session /model persists its pick into Claude's shared user settings; a
+# gateway catalog id left there breaks every later plain `claude` launch. Move
+# such ids into launcher-owned state and put back the pre-launch default.
+scrub_gateway_model_from_claude_settings() {
+  [ -f "$claude_settings" ] || return 0
+  settings_model=$(jq -er '.model | strings | select(length > 0)' "$claude_settings" 2>/dev/null) ||
+    return 0
+  gateway_catalog_model "$settings_model" || return 0
+  mkdir -p "$launcher_state_dir" || return 0
+  printf '%s\n' "$settings_model" > "$launcher_model_file" || return 0
+  if [ -n "$prior_settings_model" ]; then
+    scrubbed=$(jq --arg model "$prior_settings_model" '.model = $model' "$claude_settings" 2>/dev/null)
+  else
+    scrubbed=$(jq 'del(.model)' "$claude_settings" 2>/dev/null)
+  fi
+  [ -n "$scrubbed" ] || return 0
+  printf '%s\n' "$scrubbed" > "$claude_settings.$name.$$" || return 0
+  mv "$claude_settings.$name.$$" "$claude_settings" ||
+    rm -f "$claude_settings.$name.$$"
+}
+
+# The restorable default is whatever non-gateway model settings held before
+# launch; a gateway id already there is residue this launch also scrubs.
+prior_settings_model=
+if [ -f "$claude_settings" ]; then
+  prior_settings_model=$(jq -er '.model | strings | select(length > 0)' "$claude_settings" 2>/dev/null) ||
+    prior_settings_model=
+  if [ -n "$prior_settings_model" ] && gateway_catalog_model "$prior_settings_model"; then
+    prior_settings_model=
+  fi
+fi
+scrub_gateway_model_from_claude_settings
+
+# Keep the wrapper alive when the foreground Claude process receives terminal
+# interruption, so the authoritative gateway session ledger is still printed.
+trap ':' INT TERM
+claude --settings "$settings" --model "$selected_id" "$@"
+claude_status=$?
+scrub_gateway_model_from_claude_settings
+# Claude has returned, so keep impatient follow-up interrupts from killing the
+# bounded authoritative-ledger read. Ignored dispositions also protect curl;
+# reset them immediately before returning Claude's original status.
+trap '' INT TERM
+
+usage_json=$(
+  {
+    printf 'header = "x-api-key: %s"\n' "${ANTHROPIC_API_KEY:-$ANTHROPIC_AUTH_TOKEN}"
+    printf '%s\n' 'header = "accept: application/json"'
+  } | curl --silent --show-error --fail --max-time 8 \
+    --retry 2 --retry-max-time 20 --config - --get \
+    --data-urlencode "cache_key=$usage_key" \
+    "$ANTHROPIC_BASE_URL/api/usage/session"
+) || usage_json=
+
+usage_summary=
+if [ -n "$usage_json" ]; then
+  usage_summary=$(printf '%s\n' "$usage_json" | jq -er --arg key "$usage_key" '
+    if .cache_key != $key or (.by_model | type) != "array" then
+      error("invalid gateway usage ledger")
+    else
+      .by_model as $rows
+      | ($rows | map(.total_cost // 0) | add // 0) as $cost
+      | ($rows | map(.request_count // 0) | add // 0) as $requests
+      | ($rows | map(.prompt_tokens // 0) | add // 0) as $prompt
+      | ($rows | map(.cache_read_input_tokens // 0) | add // 0) as $cache_read
+      | ($rows | map(.cache_creation_input_tokens // 0) | add // 0) as $cache_write
+      | ($rows | map(.cache_accounted_input_tokens // 0) | add // 0) as $cache_accounted
+      | ($rows | all(.cache_metrics_complete == true)) as $cache_complete
+      | ($rows | map(.output_tokens // 0) | add // 0) as $output
+      | ($prompt + $output) as $tokens
+      | ([$cache_accounted - $cache_read - $cache_write, 0] | max) as $fresh
+      | ([$prompt - $cache_accounted, 0] | max) as $unaccounted
+      | (if $cache_complete and $cache_accounted > 0
+          then (($cache_read * 1000 / $cache_accounted | round) / 10 | tostring) + "%"
+          else "unavailable"
+        end) as $cache_pct
+      | "Gateway actual: $\($cost) · \($requests) requests · \($tokens) total tokens · \($prompt) prompt · \($cache_read)/\($cache_accounted) cache read (\($cache_pct)) · \($cache_write) cache write · \($fresh) fresh · \($unaccounted) unaccounted · \($output) output"
+    end
+  ' 2>/dev/null) || usage_summary=
+fi
+if [ -n "$usage_summary" ]; then
+  printf '%s\n' "$usage_summary"
+else
+  printf '%s\n' "$name: gateway usage summary unavailable" >&2
+fi
+
+trap - INT TERM
+exit "$claude_status"
