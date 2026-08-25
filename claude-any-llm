@@ -332,6 +332,41 @@ fi
 export ANTHROPIC_MODEL="$selected_id"
 unset CLAUDE_LLM_MODEL_FROM_SETTINGS
 
+# CONTRACT (self-contained copy of claude-launcher-tail.sh's enforcement — this script
+# is published standalone): a launcher session may never change the mainline `claude`
+# defaults. Claude Code persists in-session /model and /effort picks into the SHARED
+# user settings (.model / .effortLevel); a catalog id saved there breaks every later
+# plain `claude` launch, and an /effort pick silently retunes mainline sessions.
+# Pre-launch: residue scrub by id shape. Post-exit and every
+# CLAUDE_LAUNCHER_SCRUB_INTERVAL seconds (default 5) while the session runs: any
+# .model/.effortLevel change relative to the post-scrub snapshot is stashed into
+# launcher-owned state and the snapshot restored — no id-shape assumptions, so nothing
+# a session picks can stick, and the detached watcher also cleans up after SIGKILL.
+launcher_effort_file="$launcher_state_dir/$name.effort"
+
+read_settings_key() {
+  [ -f "$claude_settings" ] || return 0
+  jq -er --arg key "$1" '.[$key] | strings | select(length > 0)' \
+    "$claude_settings" 2>/dev/null || :
+}
+
+write_claude_settings() {
+  printf '%s\n' "$1" > "$claude_settings.$name.$$" || return 0
+  mv "$claude_settings.$name.$$" "$claude_settings" ||
+    rm -f "$claude_settings.$name.$$"
+}
+
+mainline_claude_model() {
+  case "$1" in
+    fable | opus | sonnet | haiku | default | \
+      fable'[1m]' | opus'[1m]' | sonnet'[1m]' | haiku'[1m]' | \
+      claude-* | us.anthropic.* | eu.anthropic.* | anthropic.*)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
 gateway_catalog_model() {
   # Any id containing "/" is gateway/catalog-owned even when THIS launch's catalog (one
   # gateway, one moment) does not list it — every gateway or compatibility catalog id is
@@ -339,19 +374,26 @@ gateway_catalog_model() {
   # Anthropic first-party ids (fable, opus, claude-opus-5, us.anthropic.*) never contain
   # a slash. Residue saved from a session against another gateway must still be scrubbed,
   # never left to break plain `claude`. The catalog lookup covers any slashless id THIS
-  # catalog publishes.
+  # catalog publishes, and the cross-launcher ledger covers slashless ids other
+  # launchers stashed. Mainline Anthropic ids are NEVER launcher-owned, whatever the
+  # ledger says — a diff-restore stash may capture one.
+  if mainline_claude_model "$1"; then return 1; fi
   case "$1" in */*) return 0 ;; esac
-  printf '%s\n' "$rows" | jq -e --arg model "$1" \
-    'any(.[]; .id == $model or .canonical_id == $model)' >/dev/null 2>&1
+  if printf '%s\n' "$rows" | jq -e --arg model "$1" \
+    'any(.[]; .id == $model or .canonical_id == $model)' >/dev/null 2>&1; then
+    return 0
+  fi
+  for launcher_stash_file in "$launcher_state_dir"/*.model; do
+    [ -f "$launcher_stash_file" ] || continue
+    IFS= read -r launcher_stashed_id < "$launcher_stash_file" || continue
+    [ "$1" = "$launcher_stashed_id" ] && return 0
+  done
+  return 1
 }
 
-# In-session /model persists its pick into Claude's shared user settings; a
-# gateway catalog id left there breaks every later plain `claude` launch. Move
-# such ids into launcher-owned state and put back the pre-launch default.
 scrub_gateway_model_from_claude_settings() {
-  [ -f "$claude_settings" ] || return 0
-  settings_model=$(jq -er '.model | strings | select(length > 0)' "$claude_settings" 2>/dev/null) ||
-    return 0
+  settings_model=$(read_settings_key model)
+  [ -n "$settings_model" ] || return 0
   gateway_catalog_model "$settings_model" || return 0
   mkdir -p "$launcher_state_dir" || return 0
   printf '%s\n' "$settings_model" > "$launcher_model_file" || return 0
@@ -361,29 +403,65 @@ scrub_gateway_model_from_claude_settings() {
     scrubbed=$(jq 'del(.model)' "$claude_settings" 2>/dev/null)
   fi
   [ -n "$scrubbed" ] || return 0
-  printf '%s\n' "$scrubbed" > "$claude_settings.$name.$$" || return 0
-  mv "$claude_settings.$name.$$" "$claude_settings" ||
-    rm -f "$claude_settings.$name.$$"
+  write_claude_settings "$scrubbed"
+}
+
+# A mainline-shaped model change (a concurrent plain-`claude` /model, or a wrapper user
+# deliberately picking a mainline-valid id) is ADOPTED as the new snapshot, never
+# reverted — only launcher-shaped and unknown ids, and any effort change, roll back.
+restore_mainline_claude_settings() {
+  [ -f "$claude_settings" ] || return 0
+  current_model=$(read_settings_key model)
+  current_effort=$(read_settings_key effortLevel)
+  if [ "$current_model" != "$mainline_settings_model" ] &&
+    [ -n "$current_model" ] && mainline_claude_model "$current_model"; then
+    mainline_settings_model=$current_model
+  fi
+  [ "$current_model" = "$mainline_settings_model" ] &&
+    [ "$current_effort" = "$mainline_settings_effort" ] && return 0
+  mkdir -p "$launcher_state_dir" || return 0
+  if [ "$current_model" != "$mainline_settings_model" ] && [ -n "$current_model" ]; then
+    printf '%s\n' "$current_model" > "$launcher_model_file" || return 0
+  fi
+  if [ "$current_effort" != "$mainline_settings_effort" ] && [ -n "$current_effort" ]; then
+    printf '%s\n' "$current_effort" > "$launcher_effort_file" || return 0
+  fi
+  restored=$(jq --arg model "$mainline_settings_model" --arg effort "$mainline_settings_effort" '
+    (if $model == "" then del(.model) else .model = $model end) |
+    (if $effort == "" then del(.effortLevel) else .effortLevel = $effort end)
+  ' "$claude_settings" 2>/dev/null)
+  [ -n "$restored" ] || return 0
+  write_claude_settings "$restored"
 }
 
 # The restorable default is whatever non-gateway model settings held before
 # launch; a gateway id already there is residue this launch also scrubs.
-prior_settings_model=
-if [ -f "$claude_settings" ]; then
-  prior_settings_model=$(jq -er '.model | strings | select(length > 0)' "$claude_settings" 2>/dev/null) ||
-    prior_settings_model=
-  if [ -n "$prior_settings_model" ] && gateway_catalog_model "$prior_settings_model"; then
-    prior_settings_model=
-  fi
+prior_settings_model=$(read_settings_key model)
+if [ -n "$prior_settings_model" ] && gateway_catalog_model "$prior_settings_model"; then
+  prior_settings_model=
 fi
 scrub_gateway_model_from_claude_settings
+mainline_settings_model=$(read_settings_key model)
+mainline_settings_effort=$(read_settings_key effortLevel)
+
+# Detached watcher: restore while the session lives, once more after it dies. Fds are
+# detached so output-capturing callers never wait on it; it self-terminates one
+# interval after the session ends.
+(
+  exec >/dev/null 2>&1 </dev/null
+  while kill -0 "$$" 2>/dev/null; do
+    sleep "${CLAUDE_LAUNCHER_SCRUB_INTERVAL:-5}"
+    restore_mainline_claude_settings
+  done
+  restore_mainline_claude_settings
+) &
 
 # Keep the wrapper alive when the foreground Claude process receives terminal
 # interruption, so the authoritative gateway session ledger is still printed.
 trap ':' INT TERM
 claude --settings "$settings" --model "$selected_id" "$@"
 claude_status=$?
-scrub_gateway_model_from_claude_settings
+restore_mainline_claude_settings
 # Claude has returned, so keep impatient follow-up interrupts from killing the
 # bounded authoritative-ledger read. Ignored dispositions also protect curl;
 # reset them immediately before returning Claude's original status.
