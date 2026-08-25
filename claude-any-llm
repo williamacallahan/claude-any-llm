@@ -333,6 +333,10 @@ export ANTHROPIC_MODEL="$selected_id"
 unset CLAUDE_LLM_MODEL_FROM_SETTINGS
 
 gateway_catalog_model() {
+  # Any llmgw-anthropic/<base64url> id is a gateway catalog id even when THIS launch's
+  # catalog (one gateway, one moment) does not list it — a residue id saved from a session
+  # against another gateway must still be scrubbed, never left to break plain `claude`.
+  case "$1" in llmgw-anthropic/*) return 0 ;; esac
   printf '%s\n' "$rows" | jq -e --arg model "$1" \
     'any(.[]; .id == $model or .canonical_id == $model)' >/dev/null 2>&1
 }
