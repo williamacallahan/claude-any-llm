@@ -3,7 +3,7 @@
 
 name=$(basename "$0")
 base_url="${ANTHROPIC_BASE_URL:-https://dev.api.llm-gateway.iocloudhost.net}"
-default_model=stealth/ox-alpha
+default_model=qwen3.8-27b
 requested_model="${ANTHROPIC_MODEL:-}"
 # The credential re-exec below re-enters this script with ANTHROPIC_MODEL
 # already exported. Without this marker that second pass cannot tell a
