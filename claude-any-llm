@@ -491,7 +491,9 @@ mainline_settings_effort=$(read_settings_key effortLevel)
 # Keep the wrapper alive when the foreground Claude process receives terminal
 # interruption, so the authoritative gateway session ledger is still printed.
 trap ':' INT TERM
-claude --settings "$settings" --model "$selected_id" "$@"
+unset CODEX_LB_API_KEY
+PATH="$HOME/.local/libexec/codex-lb:$PATH" \
+  claude --settings "$settings" --model "$selected_id" "$@"
 claude_status=$?
 restore_mainline_claude_settings
 # Claude has returned, so keep impatient follow-up interrupts from killing the
