@@ -178,6 +178,18 @@ if ! printf '%s\n' "${ANTHROPIC_CUSTOM_HEADERS:-}" |
   ANTHROPIC_CUSTOM_HEADERS="$ANTHROPIC_CUSTOM_HEADERS
 X-LGW-First-Byte-Budget-S: ${CLAUDE_LLM_FIRST_BYTE_BUDGET_S:-1500}"
 fi
+# KV-cache repeater identity (X-LGW-Affinity-Key): one prompt family per
+# project, so the gateway pins every session of this project to ONE warm
+# self-hosted host — a NEW session then reuses that host's warm system-prompt
+# prefix instead of scattering to a cold host on its per-session salt (#368).
+# Same block as claude-qwen/gemma/muse; a caller-set key is respected untouched.
+if ! printf '%s\n' "${ANTHROPIC_CUSTOM_HEADERS:-}" |
+  grep -qi '^[[:space:]]*x-lgw-affinity-key[[:space:]]*:'; then
+  project_root=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+  affinity_family="cc:$(printf '%s' "$(basename "$project_root")" | tr -c 'A-Za-z0-9._-' '-')"
+  ANTHROPIC_CUSTOM_HEADERS="$ANTHROPIC_CUSTOM_HEADERS
+X-LGW-Affinity-Key: $affinity_family"
+fi
 export ANTHROPIC_CUSTOM_HEADERS
 
 # Credentials travel through curl's stdin config, never its argv. Supplying an
@@ -351,9 +363,12 @@ read_settings_key() {
 }
 
 write_claude_settings() {
-  printf '%s\n' "$1" > "$claude_settings.$name.$$" || return 0
-  mv "$claude_settings.$name.$$" "$claude_settings" ||
-    rm -f "$claude_settings.$name.$$"
+  # mktemp, not a $$-suffixed name: the watcher subshell shares the parent's $$, so a
+  # post-exit restore racing a watcher tick would interleave writes into one temp file
+  # and mv corrupt JSON into settings.json — which the jq-guarded restore cannot heal.
+  settings_tmp=$(mktemp "$claude_settings.$name.XXXXXX" 2>/dev/null) || return 0
+  printf '%s\n' "$1" > "$settings_tmp" || { rm -f "$settings_tmp"; return 0; }
+  mv "$settings_tmp" "$claude_settings" || rm -f "$settings_tmp"
 }
 
 mainline_claude_model() {
