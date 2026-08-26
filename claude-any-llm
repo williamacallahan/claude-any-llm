@@ -125,9 +125,17 @@ export API_TIMEOUT_MS API_FORCE_IDLE_TIMEOUT CLAUDE_STREAM_IDLE_TIMEOUT_MS \
   CLAUDE_ASYNC_AGENT_STALL_TIMEOUT_MS
 
 # Ignore model slots inherited from another Claude launcher. The selected
-# compatibility ID is the only model this launcher chooses.
+# compatibility ID is the only model this launcher chooses — except the Sonnet
+# slot, which CC's auto-mode safety judge resolves through: it is pinned to the
+# cache-honoring classifier below once the catalog confirms this gateway serves it.
 unset ANTHROPIC_DEFAULT_HAIKU_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL
 unset ANTHROPIC_DEFAULT_OPUS_MODEL ANTHROPIC_SMALL_FAST_MODEL
+# Auto-mode safety judge (SONNET slot): z-ai/glm-5.3-flash (OpenRouter,
+# Anthropic-protocol) honors the judge's cache_control:ephemeral system block,
+# so repeat judge calls read the ~30k-token prefix from cache ($0.015/M vs
+# $0.075/M input). Applied after the catalog fetch below only when this
+# gateway publishes the alias; a gateway without it keeps the slot unset.
+classifier_model="${CLAUDE_LLM_CLASSIFIER_MODEL:-z-ai/glm-5.3-flash}"
 
 # Credentials are selective: existing Anthropic credentials, an optional
 # launcher env file, or exactly one Doppler personal/dev secret.
@@ -343,6 +351,15 @@ fi
 
 export ANTHROPIC_MODEL="$selected_id"
 unset CLAUDE_LLM_MODEL_FROM_SETTINGS
+
+# Pin the auto-mode judge only on gateways that serve the classifier alias.
+if printf '%s\n' "$rows" | jq -e --arg model "$classifier_model" \
+  'any(.[]; .id == $model or .canonical_id == $model)' >/dev/null 2>&1; then
+  export ANTHROPIC_DEFAULT_SONNET_MODEL="$classifier_model"
+else
+  printf '%s\n' \
+    "$name: classifier '$classifier_model' not in this gateway's catalog; judge slot left unset" >&2
+fi
 
 # CONTRACT (self-contained copy of claude-launcher-tail.sh's enforcement — this script
 # is published standalone): a launcher session may never change the mainline `claude`
