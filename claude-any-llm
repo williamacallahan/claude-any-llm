@@ -116,11 +116,11 @@ export CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1
 : "${API_TIMEOUT_MS:=3000000}"
 : "${API_FORCE_IDLE_TIMEOUT:=0}"
 : "${CLAUDE_STREAM_IDLE_TIMEOUT_MS:=1800000}"
-# Background (async) agents have their own progress watchdog; a busy fleet
-# stalls them at the unmanaged 600s default before any byte arrives (#429;
-# incident evidence and the ladder live in contracts/cross-plane.json under
-# managed_launcher_async_agent_stall_timeout_ms). A caller-set value wins.
-: "${CLAUDE_ASYNC_AGENT_STALL_TIMEOUT_MS:=1800000}"
+# Background (async) agents have an outer progress watchdog. Keep it beyond
+# the inner 1800s stream recovery plus one 1500s first-progress wait and the
+# 300s policy margin (#429; derivation in contracts/cross-plane.json). A
+# caller-set value wins.
+: "${CLAUDE_ASYNC_AGENT_STALL_TIMEOUT_MS:=3600000}"
 export API_TIMEOUT_MS API_FORCE_IDLE_TIMEOUT CLAUDE_STREAM_IDLE_TIMEOUT_MS \
   CLAUDE_ASYNC_AGENT_STALL_TIMEOUT_MS
 
