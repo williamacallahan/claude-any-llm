@@ -17,7 +17,7 @@ curl -fsSL -o ~/.local/bin/claude-any-llm \
 chmod +x ~/.local/bin/claude-any-llm
 ```
 
-The default model is `stealth/ox-alpha` through the development Squirrel gateway. The launcher:
+The default model is `qwen3.8-27b` through the development Squirrel gateway. The launcher:
 
 - reads the live gateway compatibility catalog instead of restating model metadata;
 - applies the published context and output limits to Claude Code;
@@ -38,7 +38,7 @@ Examples:
 ```sh
 claude-any-llm
 claude-any-llm --model stealth/ox-alpha
-claude-any-llm --model qwen3.8-27b --verbose
+claude-any-llm --model qwen3.6-plus --verbose
 ```
 
 Claude Code's `/usage` remains a client estimate for custom models. The `Gateway actual:` line printed after the session is the gateway's persisted provider-resolved ledger.
