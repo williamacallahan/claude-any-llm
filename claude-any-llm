@@ -7,30 +7,25 @@ default_model=qwen3.8-27b
 requested_model="${ANTHROPIC_MODEL:-}"
 # The credential re-exec below re-enters this script with ANTHROPIC_MODEL
 # already exported. Without this marker that second pass cannot tell a
-# settings.json-derived id from an explicit one, so it skips the default-model
-# fallback and hard-fails on any settings model the gateway does not publish.
-requested_from_settings=false
-if [ -n "$requested_model" ] && [ -n "${CLAUDE_LLM_MODEL_FROM_SETTINGS:-}" ]; then
-  requested_from_settings=true
+# continuity-state id from an explicit one, so it skips the default-model
+# fallback and hard-fails on any stashed model the gateway does not publish.
+requested_from_state=false
+if [ -n "$requested_model" ] && [ -n "${CLAUDE_LLM_MODEL_FROM_STATE:-}" ]; then
+  requested_from_state=true
 fi
 key_secret=LLM_GATEWAY_DEV_API_KEY
 launcher_state_dir="$HOME/.config/claude-llm"
 launcher_model_file="$launcher_state_dir/$name.model"
 claude_settings="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json"
 
-# /model persists the chosen id in Claude's SHARED user settings, which breaks
-# plain `claude` against api.anthropic.com. The post-exit scrub below moves
-# gateway ids into $launcher_model_file, so launcher continuity reads that
-# launcher-owned state first; a settings.json gateway id is pre-scrub residue
-# and still honored here for one launch before the scrub migrates it.
+# Launcher continuity reads ONLY launcher-owned state: a set-as-default this
+# launcher's own session made, stashed by the scrub below. A gateway id sitting
+# in Claude's SHARED settings.json is residue of unknown origin — possibly a
+# concurrent OTHER launcher's pick (#459) — so it is quarantined by the scrub,
+# never adopted as this launcher's model.
 if [ -z "$requested_model" ] && [ -f "$launcher_model_file" ]; then
   IFS= read -r requested_model < "$launcher_model_file" || :
-  [ -z "$requested_model" ] || requested_from_settings=true
-fi
-if [ -z "$requested_model" ] && [ -f "$claude_settings" ]; then
-  requested_model=$(jq -er '.model | strings | select(length > 0)' "$claude_settings" 2>/dev/null) ||
-    requested_model=
-  [ -z "$requested_model" ] || requested_from_settings=true
+  [ -z "$requested_model" ] || requested_from_state=true
 fi
 requested_model="${requested_model:-$default_model}"
 
@@ -60,7 +55,7 @@ while [ "$1" != "$model_argument_boundary" ]; do
         exit 64
       }
       model_option_seen=true
-      requested_from_settings=false
+      requested_from_state=false
       model_option=$1
       shift
       if [ "$1" = "$model_argument_boundary" ] || [ -z "$1" ] ||
@@ -77,7 +72,7 @@ while [ "$1" != "$model_argument_boundary" ]; do
         exit 64
       }
       model_option_seen=true
-      requested_from_settings=false
+      requested_from_state=false
       requested_model=${1#*=}
       if [ -z "$requested_model" ]; then
         echo "$name: $1 needs a value" >&2
@@ -145,10 +140,10 @@ if [ -z "${ANTHROPIC_AUTH_TOKEN:-}" ] && [ -z "${ANTHROPIC_API_KEY:-}" ] &&
 fi
 if [ -z "${ANTHROPIC_AUTH_TOKEN:-}" ] && [ -z "${ANTHROPIC_API_KEY:-}" ]; then
   export CLAUDE_LLM_KEY_SECRET="$key_secret"
-  if [ "$requested_from_settings" = true ]; then
-    export CLAUDE_LLM_MODEL_FROM_SETTINGS=1
+  if [ "$requested_from_state" = true ]; then
+    export CLAUDE_LLM_MODEL_FROM_STATE=1
   else
-    unset CLAUDE_LLM_MODEL_FROM_SETTINGS
+    unset CLAUDE_LLM_MODEL_FROM_STATE
   fi
   exec doppler run --no-fallback -p personal -c dev --only-secrets "$key_secret" -- sh -c '
     eval "ANTHROPIC_AUTH_TOKEN=\"\${$CLAUDE_LLM_KEY_SECRET:?not in Doppler personal/dev}\""
@@ -238,8 +233,9 @@ selected=$(printf '%s\n' "$rows" | jq -ce --arg model "$requested_model" '
   [.[] | select(.id == $model or .canonical_id == $model)]
   | if length == 1 then .[0] else error("model missing or ambiguous") end
 ' 2>/dev/null)
-if [ -z "${selected:-}" ] && [ "$requested_from_settings" = true ]; then
+if [ -z "${selected:-}" ] && [ "$requested_from_state" = true ]; then
   requested_model=$default_model
+  requested_from_state=false
   selected=$(printf '%s\n' "$rows" | jq -ce --arg model "$requested_model" '
     [.[] | select(.id == $model or .canonical_id == $model)]
     | if length == 1 then .[0] else error("default model missing or ambiguous") end
@@ -309,6 +305,10 @@ summary=$(printf '%s\n' "$selected" | jq -er '
   exit 65
 }
 printf '%s: %s\n' "$name" "$summary" >&2
+if [ "$requested_from_state" = true ]; then
+  printf '%s\n' \
+    "$name: model '$requested_model' restored from a prior set-as-default ($launcher_model_file); relaunch with --model, or delete that file to reset to $default_model." >&2
+fi
 printf '%s\n' \
   "$name: /model is locked to this startup model; relaunch with --model to recompute numeric limits." >&2
 printf '%s\n' \
@@ -361,7 +361,7 @@ export ANTHROPIC_DEFAULT_SONNET_MODEL="$selected_id"
 export ANTHROPIC_DEFAULT_OPUS_MODEL="$selected_id"
 export ANTHROPIC_SMALL_FAST_MODEL="$selected_id"
 export CLAUDE_CODE_SUBAGENT_MODEL="$selected_id"
-unset CLAUDE_LLM_MODEL_FROM_SETTINGS
+unset CLAUDE_LLM_MODEL_FROM_STATE
 
 catalog_has_model() {
   printf '%s\n' "$rows" | jq -e --arg model "$1" \
@@ -375,9 +375,12 @@ catalog_has_model() {
 # plain `claude` launch, and an /effort pick silently retunes mainline sessions.
 # Pre-launch: residue scrub by id shape. Post-exit and every
 # CLAUDE_LAUNCHER_SCRUB_INTERVAL seconds (default 5) while the session runs: any
-# .model/.effortLevel change relative to the post-scrub snapshot is stashed into
-# launcher-owned state and the snapshot restored — no id-shape assumptions, so nothing
-# a session picks can stick, and the detached watcher also cleans up after SIGKILL.
+# .model/.effortLevel change relative to the post-scrub snapshot is stashed and the
+# snapshot restored — no id-shape assumptions, so nothing a session picks can stick,
+# and the detached watcher also cleans up after SIGKILL. Only the locked id this
+# session itself exported is claimed as this launcher's continuity; any other id goes
+# to the shared quarantine (quarantined.model) — a scrub cannot know WHICH concurrent
+# session picked a foreign id, so no launcher adopts it (llm-inference-network #459).
 launcher_effort_file="$launcher_state_dir/$name.effort"
 
 # Launcher state never stores a compatibility id: strip the readable
@@ -385,6 +388,23 @@ launcher_effort_file="$launcher_state_dir/$name.effort"
 # (matched back via .canonical_id at the next launch). Never an encoded token.
 stash_launcher_model() {
   printf '%s\n' "${1#llmgw-anthropic/}" > "$launcher_model_file"
+}
+
+# A model this session did not itself export was picked in SOME session — recorded
+# (deduped) so the residue scrub still recognizes it, owned by nobody for continuity.
+quarantine_model() {
+  quarantined_id="${1#llmgw-anthropic/}"
+  quarantine_file="$launcher_state_dir/quarantined.model"
+  grep -qxF "$quarantined_id" "$quarantine_file" 2>/dev/null && return 0
+  printf '%s\n' "$quarantined_id" >> "$quarantine_file"
+}
+
+claim_or_quarantine_model() {
+  if [ "$1" = "$selected_id" ] || [ "$1" = "${selected_id#llmgw-anthropic/}" ]; then
+    stash_launcher_model "$1"
+  else
+    quarantine_model "$1"
+  fi
 }
 
 read_settings_key() {
@@ -428,10 +448,10 @@ gateway_catalog_model() {
   if catalog_has_model "$1"; then
     return 0
   fi
+  # quarantined.model rides the same glob and may hold several lines; match any.
   for launcher_stash_file in "$launcher_state_dir"/*.model; do
     [ -f "$launcher_stash_file" ] || continue
-    IFS= read -r launcher_stashed_id < "$launcher_stash_file" || continue
-    [ "$1" = "$launcher_stashed_id" ] && return 0
+    grep -qxF "$1" "$launcher_stash_file" 2>/dev/null && return 0
   done
   return 1
 }
@@ -441,7 +461,7 @@ scrub_gateway_model_from_claude_settings() {
   [ -n "$settings_model" ] || return 0
   gateway_catalog_model "$settings_model" || return 0
   mkdir -p "$launcher_state_dir" || return 0
-  stash_launcher_model "$settings_model" || return 0
+  claim_or_quarantine_model "$settings_model" || return 0
   if [ -n "$prior_settings_model" ]; then
     scrubbed=$(jq --arg model "$prior_settings_model" '.model = $model' "$claude_settings" 2>/dev/null)
   else
@@ -466,7 +486,7 @@ restore_mainline_claude_settings() {
     [ "$current_effort" = "$mainline_settings_effort" ] && return 0
   mkdir -p "$launcher_state_dir" || return 0
   if [ "$current_model" != "$mainline_settings_model" ] && [ -n "$current_model" ]; then
-    stash_launcher_model "$current_model" || return 0
+    claim_or_quarantine_model "$current_model" || return 0
   fi
   if [ "$current_effort" != "$mainline_settings_effort" ] && [ -n "$current_effort" ]; then
     printf '%s\n' "$current_effort" > "$launcher_effort_file" || return 0
