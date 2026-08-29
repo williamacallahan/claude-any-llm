@@ -124,10 +124,21 @@ export API_TIMEOUT_MS API_FORCE_IDLE_TIMEOUT CLAUDE_STREAM_IDLE_TIMEOUT_MS \
   CLAUDE_ASYNC_AGENT_STALL_TIMEOUT_MS
 
 # Ignore model slots inherited from another Claude launcher. The selected
-# compatibility ID is the only model this launcher permits in the session.
+# compatibility ID is the only model this launcher permits in the session —
+# except the Sonnet slot, which CC's auto-mode permission judge resolves
+# through: it is pinned to the cache-honoring classifier below once the
+# catalog confirms this gateway serves it.
 unset ANTHROPIC_DEFAULT_MODEL ANTHROPIC_DEFAULT_FABLE_MODEL
 unset ANTHROPIC_DEFAULT_HAIKU_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL
 unset ANTHROPIC_DEFAULT_OPUS_MODEL ANTHROPIC_SMALL_FAST_MODEL
+# Auto-mode permission judge (SONNET slot): z-ai/glm-5.3-flash (OpenRouter,
+# Anthropic-protocol) honors the judge's cache_control:ephemeral system block,
+# so repeat judge calls read the ~30k-token prefix from cache ($0.015/M vs
+# $0.075/M input). Claude Code vets the Sonnet-slot pin against
+# availableModels, so the classifier also joins that allowlist and the
+# gateway session-model lock; a gateway without the alias keeps the judge on
+# the startup model.
+classifier_model="${CLAUDE_LLM_CLASSIFIER_MODEL:-z-ai/glm-5.3-flash}"
 
 # Credentials are selective: existing Anthropic credentials, an optional
 # launcher env file, or exactly one Doppler personal/dev secret.
@@ -158,7 +169,8 @@ if [ -z "${ANTHROPIC_AUTH_TOKEN:-}" ] && [ -z "${ANTHROPIC_API_KEY:-}" ]; then
 fi
 
 usage_key="claude-any-llm:$(uuidgen | tr '[:upper:]' '[:lower:]')"
-for reserved_header in x-lgw-cache-key x-lgw-claude-code-catalog x-lgw-claude-session-model; do
+for reserved_header in x-lgw-cache-key x-lgw-claude-code-catalog \
+  x-lgw-claude-session-model x-lgw-claude-session-classifier-model; do
   if printf '%s\n' "${ANTHROPIC_CUSTOM_HEADERS:-}" |
     grep -qi "^[[:space:]]*$reserved_header[[:space:]]*:"; then
     echo "$name: ANTHROPIC_CUSTOM_HEADERS already sets $reserved_header" >&2
@@ -250,6 +262,25 @@ selected_id=$(printf '%s\n' "$selected" | jq -r '.id')
 ANTHROPIC_CUSTOM_HEADERS="$ANTHROPIC_CUSTOM_HEADERS
 X-LGW-Claude-Session-Model: $selected_id"
 export ANTHROPIC_CUSTOM_HEADERS
+
+catalog_has_model() {
+  printf '%s\n' "$rows" | jq -e --arg model "$1" \
+    'any(.[]; .id == $model or .canonical_id == $model)' >/dev/null 2>&1
+}
+
+# Pin the auto-mode permission judge only on gateways that serve the classifier
+# alias. The declared classifier is the ONLY second model the gateway's
+# session-model lock admits; the /model picker also lists it, and a pick is
+# quarantined by the scrub below like any other non-startup id.
+if catalog_has_model "$classifier_model"; then
+  ANTHROPIC_CUSTOM_HEADERS="$ANTHROPIC_CUSTOM_HEADERS
+X-LGW-Claude-Session-Classifier-Model: $classifier_model"
+  export ANTHROPIC_CUSTOM_HEADERS
+else
+  printf '%s\n' \
+    "$name: classifier '$classifier_model' not in this gateway's catalog; judge stays on the startup model" >&2
+  classifier_model=
+fi
 selected_limits=$(printf '%s\n' "$selected" | jq -r '
   def integer_or_zero:
     if type == "number" and . > 0 and floor == . then . else 0 end;
@@ -310,7 +341,7 @@ if [ "$requested_from_state" = true ]; then
     "$name: model '$requested_model' restored from a prior set-as-default ($launcher_model_file); relaunch with --model, or delete that file to reset to $default_model." >&2
 fi
 printf '%s\n' \
-  "$name: /model is locked to this startup model; relaunch with --model to recompute numeric limits." >&2
+  "$name: /model is locked to this startup model (auto-mode judge excepted); relaunch with --model to recompute numeric limits." >&2
 printf '%s\n' \
   "$name: Claude /usage is a client estimate; gateway actual is printed on exit." >&2
 
@@ -337,11 +368,12 @@ fi
 unset DISABLE_COMPACT DISABLE_AUTO_COMPACT CLAUDE_AUTOCOMPACT_PCT_OVERRIDE
 settings=$(jq -cn \
   --arg model "$selected_id" \
+  --arg classifier "$classifier_model" \
   --arg max_context "$max_context_tokens" \
   --arg auto_compact "$auto_compact_tokens" \
   --arg max_output "$output_tokens" '{
     autoCompactEnabled: true,
-    availableModels: [$model],
+    availableModels: ([$model, $classifier] | map(select(length > 0))),
     enforceAvailableModels: true,
     env: {
       CLAUDE_CODE_MAX_CONTEXT_TOKENS: $max_context,
@@ -357,16 +389,11 @@ export ANTHROPIC_MODEL="$selected_id"
 export ANTHROPIC_DEFAULT_MODEL="$selected_id"
 export ANTHROPIC_DEFAULT_FABLE_MODEL="$selected_id"
 export ANTHROPIC_DEFAULT_HAIKU_MODEL="$selected_id"
-export ANTHROPIC_DEFAULT_SONNET_MODEL="$selected_id"
+export ANTHROPIC_DEFAULT_SONNET_MODEL="${classifier_model:-$selected_id}"
 export ANTHROPIC_DEFAULT_OPUS_MODEL="$selected_id"
 export ANTHROPIC_SMALL_FAST_MODEL="$selected_id"
 export CLAUDE_CODE_SUBAGENT_MODEL="$selected_id"
 unset CLAUDE_LLM_MODEL_FROM_STATE
-
-catalog_has_model() {
-  printf '%s\n' "$rows" | jq -e --arg model "$1" \
-    'any(.[]; .id == $model or .canonical_id == $model)' >/dev/null 2>&1
-}
 
 # CONTRACT (self-contained copy of claude-launcher-tail.sh's enforcement — this script
 # is published standalone): a launcher session may never change the mainline `claude`
