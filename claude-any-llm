@@ -330,10 +330,10 @@ summary=$(printf '%s\n' "$selected" | jq -er '
 printf '%s: %s\n' "$name" "$summary" >&2
 if [ "$requested_from_state" = true ]; then
   printf '%s\n' \
-    "$name: model '$requested_model' restored from a prior set-as-default ($launcher_model_file); relaunch with --model, or delete that file to reset to $default_model." >&2
+    "$name: model '$requested_model' restored from a prior /model pick or set-as-default ($launcher_model_file); relaunch with --model, or delete that file to reset to $default_model." >&2
 fi
 printf '%s\n' \
-  "$name: /model switches freely among catalog models; numeric limits stay computed for the startup model — relaunch with --model to recompute them." >&2
+  "$name: /model switches freely among catalog models; a pick becomes the next launch's model, and numeric limits recompute only at launch." >&2
 printf '%s\n' \
   "$name: Claude /usage is a client estimate; gateway actual is printed on exit." >&2
 
@@ -395,11 +395,12 @@ unset CLAUDE_LLM_MODEL_FROM_STATE
 # Pre-launch: residue scrub by id shape. Post-exit and every
 # CLAUDE_LAUNCHER_SCRUB_INTERVAL seconds (default 5) while the session runs: any
 # .model/.effortLevel change relative to the post-scrub snapshot is stashed and the
-# snapshot restored — no id-shape assumptions, so nothing a session picks can stick,
-# and the detached watcher also cleans up after SIGKILL. Only the startup id this
-# session itself exported is claimed as this launcher's continuity; any other id goes
-# to the shared quarantine (quarantined.model) — a scrub cannot know WHICH concurrent
-# session picked a foreign id, so no launcher adopts it (llm-inference-network #459).
+# snapshot restored — no pick sticks in the SHARED settings, and the detached
+# watcher also cleans up after SIGKILL. An observed in-session pick of a model in
+# THIS launch's catalog is claimed as the launcher's continuity (next launch adopts
+# it and recomputes limits); any other id, and all launch-time residue of unknown
+# origin, goes to the shared quarantine (quarantined.model) — a scrub cannot know
+# WHICH concurrent session picked a foreign id, so no launcher adopts one (#459).
 launcher_effort_file="$launcher_state_dir/$name.effort"
 
 # Launcher state never stores a compatibility id: strip the readable
@@ -504,8 +505,16 @@ restore_mainline_claude_settings() {
   [ "$current_model" = "$mainline_settings_model" ] &&
     [ "$current_effort" = "$mainline_settings_effort" ] && return 0
   mkdir -p "$launcher_state_dir" || return 0
+  # An in-session pick of a model THIS catalog serves becomes the launcher's
+  # continuity, so a bare relaunch adopts it and recomputes its numeric limits
+  # — the only lane Claude Code offers for per-model limits. Ids the catalog
+  # does not serve keep #459's no-adoption rule.
   if [ "$current_model" != "$mainline_settings_model" ] && [ -n "$current_model" ]; then
-    claim_or_quarantine_model "$current_model" || return 0
+    if catalog_has_model "$current_model"; then
+      stash_launcher_model "$current_model" || return 0
+    else
+      quarantine_model "$current_model" || return 0
+    fi
   fi
   if [ "$current_effort" != "$mainline_settings_effort" ] && [ -n "$current_effort" ]; then
     printf '%s\n' "$current_effort" > "$launcher_effort_file" || return 0
