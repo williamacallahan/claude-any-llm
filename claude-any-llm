@@ -251,6 +251,11 @@ if ! printf '%s\n' "${ANTHROPIC_CUSTOM_HEADERS:-}" |
   ANTHROPIC_CUSTOM_HEADERS="$ANTHROPIC_CUSTOM_HEADERS
 X-LGW-Affinity-Key: $affinity_family"
 fi
+if ! printf '%s\n' "${ANTHROPIC_CUSTOM_HEADERS:-}" |
+  grep -qi '^[[:space:]]*x-user-id[[:space:]]*:'; then
+  ANTHROPIC_CUSTOM_HEADERS="$ANTHROPIC_CUSTOM_HEADERS
+X-User-ID: claude-code:codeAgent"
+fi
 export ANTHROPIC_CUSTOM_HEADERS
 
 # Credentials travel through curl's stdin config, never its argv. Supplying an
