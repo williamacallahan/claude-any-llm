@@ -443,7 +443,20 @@ if [ -n "$usage_json" ]; then
       error("invalid gateway usage ledger")
     else
       .by_model as $rows
-      | ($rows | map(.total_cost // 0) | add // 0) as $cost
+      | ($rows | all(.[]; (.total_cost | type) == "number")) as $totals_valid
+      | ($rows | all(.[]; .cost_complete == true and .unpriced_generation_count == 0)) as $cost_complete
+      | if ($totals_valid | not) then
+          error("invalid gateway usage ledger cost")
+        else
+          ($rows | map(.total_cost) | add // 0) as $cost
+          | ($rows | map(.unpriced_generation_count) | add) as $unpriced
+          | (if $cost_complete then
+              "Gateway actual: $\($cost)"
+            elif ($rows | all(.[]; (.unpriced_generation_count | type) == "number")) then
+              "Gateway cost unknown (known subtotal: $\($cost); \($unpriced) unpriced generations)"
+            else
+              "Gateway cost unknown (known subtotal: $\($cost); price coverage unavailable)"
+            end) as $cost_label
       | ($rows | map(.request_count // 0) | add // 0) as $requests
       | ($rows | map(.prompt_tokens // 0) | add // 0) as $prompt
       | ($rows | map(.cache_read_input_tokens // 0) | add // 0) as $cache_read
@@ -458,7 +471,8 @@ if [ -n "$usage_json" ]; then
           then (($cache_read * 1000 / $cache_accounted | round) / 10 | tostring) + "%"
           else "unavailable"
         end) as $cache_pct
-      | "Gateway actual: $\($cost) · \($requests) requests · \($tokens) total tokens · \($prompt) prompt · \($cache_read)/\($cache_accounted) cache read (\($cache_pct)) · \($cache_write) cache write · \($fresh) fresh · \($unaccounted) unaccounted · \($output) output"
+      | "\($cost_label) · \($requests) requests · \($tokens) total tokens · \($prompt) prompt · \($cache_read)/\($cache_accounted) cache read (\($cache_pct)) · \($cache_write) cache write · \($fresh) fresh · \($unaccounted) unaccounted · \($output) output"
+        end
     end
   ' 2>/dev/null) || usage_summary=
 fi
