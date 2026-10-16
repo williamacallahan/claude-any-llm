@@ -45,7 +45,7 @@ the first lane that can actually catch the regression.
 | 2. Lint | `shellcheck -s sh -e SC1090,SC2016,SC1087 claude-any-llm` | No new shell defects. |
 | 3. Drift | `cmp claude-any-llm ~/Developer/git/llm-inference-network/llm-gateway/scripts/claude-any-llm` | The mirror is byte-identical to canonical, so canonical's suite covers this file. |
 | 4. Probe | `./claude-any-llm --model` (and other argv errors) | Pre-network argument handling, without credentials. Ephemeral — never commit. |
-| 5. Behavior | in `llm-inference-network/llm-gateway/backend`: `uv run --quiet python -m pytest -q tests/unit/test_scripts/test_claude_any_llm_launcher.py tests/unit/test_scripts/test_claude_any_llm_model_lock.py` | The launcher's committed contracts. New tests go here, never in this repo. |
+| 5. Behavior | in `llm-inference-network/llm-gateway/backend`: `uv run --quiet python -m pytest -q tests/unit/test_scripts/test_claude_any_llm_launcher.py tests/unit/test_scripts/test_claude_any_llm_catalog_window.py` | The launcher's committed contracts. New tests go here, never in this repo. |
 
 The three lane-2 exclusions are verified non-defects, not silencing: SC1087 is a
 false positive (`$reserved_header[[:space:]]` is regex text in POSIX `sh`, which
