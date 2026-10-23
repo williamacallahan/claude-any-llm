@@ -17,14 +17,14 @@ curl -fsSL -o ~/.local/bin/claude-any-llm \
 chmod +x ~/.local/bin/claude-any-llm
 ```
 
-The default model is `qwen3.8-27b` through the development Squirrel gateway. The launcher:
+The default model is `qwen3.8-flash-long-context` through the development Squirrel gateway. The launcher:
 
 - reads the live gateway compatibility catalog instead of restating model metadata;
 - applies the published context and output limits to Claude Code;
 - shows the selected model's pricing, reasoning levels, and capabilities;
 - accepts `-m`/`--model` to select another gateway model;
-- remembers an in-session `/model` pick in `~/.config/claude-llm/claude-any-llm.model` and reuses it on the next launch;
-- scrubs gateway catalog ids out of `~/.claude/settings.json` before launch and on exit, restoring the prior default so plain `claude` sessions against api.anthropic.com keep working; and
+- runs Claude Code with its own `CLAUDE_CONFIG_DIR`, `~/.config/claude-llm/claude-any-llm/`, whose transcripts, history, `.claude.json`, plans, skills, plugins, and peer session registry link back to the shared `~/.claude`, so `/resume` and history stay shared with plain `claude`;
+- rebuilds that directory's private `settings.json` each launch from the shared settings minus `model` and `effortLevel`, so an in-session `/model` or `/effort` pick persists there and is reused on the next launch, and never edits the shared `~/.claude/settings.json`; and
 - prints the authoritative gateway session cost, request count, token totals, and cache-read portion on exit, including Ctrl-C exits.
 
 Credentials are resolved in this order:
