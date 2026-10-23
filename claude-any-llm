@@ -15,9 +15,11 @@ die() { exit_status=$1; shift; say "$@"; exit "$exit_status"; }
 # so a launcher session runs in its own config dir: those picks stay launcher-private
 # and plain `claude` never inherits a catalog id. Everything a resumed or remembered
 # session needs (transcripts, prompt history, trust and MCP state in .claude.json,
-# checkpoints, plans, pastes) links back to the shared dir, so /resume and history stay
-# one store with plain `claude`. Claude Code writes history.jsonl and .claude.json in
-# place, so the links survive a session.
+# checkpoints, plans, pastes, the pid-keyed peer session registry) links back to the
+# shared dir, so /resume, history, and peer messaging stay one store with plain `claude`.
+# Claude Code writes history.jsonl and .claude.json in place, so the links survive a
+# session. Background jobs stay private: each config dir's daemon owns its jobs, and a
+# shared jobs dir would let one daemon resume the other's jobs on the wrong provider.
 launcher_config_dir="$HOME/.config/claude-llm/$name"
 launcher_settings="$launcher_config_dir/settings.json"
 # Links $2 to $1. An existing correct link (a concurrent first launch made it) is
@@ -39,7 +41,7 @@ if [ "${CLAUDE_CONFIG_DIR:-}" != "$launcher_config_dir" ]; then
   # Absent shared targets are created first (files no-clobber, never truncated), so a
   # first launcher run cannot fork state that plain `claude` would later create.
   for shared_entry in projects history.jsonl CLAUDE.md rules skills agents commands \
-    hooks output-styles memories plugins file-history plans paste-cache; do
+    hooks output-styles memories plugins file-history plans paste-cache sessions; do
     shared_path="$shared_config_dir/$shared_entry"
     [ -L "$shared_path" ] && [ ! -e "$shared_path" ] && die 73 "$shared_path is a dangling link"
     if [ ! -e "$shared_path" ]; then
@@ -56,6 +58,12 @@ if [ "${CLAUDE_CONFIG_DIR:-}" != "$launcher_config_dir" ]; then
     esac || die 73 "shared state has the wrong type: $shared_path"
     link_shared_entry "$shared_path" "$launcher_config_dir/$shared_entry" || exit 73
   done
+  # Custom keybindings are linked only when the user has some: an empty file is not
+  # valid keybindings JSON, so the launcher never creates one.
+  if [ -f "$shared_config_dir/keybindings.json" ]; then
+    link_shared_entry "$shared_config_dir/keybindings.json" \
+      "$launcher_config_dir/keybindings.json" || exit 73
+  fi
   # A missing .claude.json is Claude Code's defaults; it writes the file through the link.
   if [ ! -e "$shared_global_config" ] && [ ! -L "$shared_global_config" ]; then
     (set -C; : > "$shared_global_config") 2>/dev/null ||
@@ -174,21 +182,24 @@ export CLAUDE_CODE_DISABLE_LEGACY_MODEL_REMAP=1
 export API_TIMEOUT_MS API_FORCE_IDLE_TIMEOUT CLAUDE_STREAM_IDLE_TIMEOUT_MS \
   CLAUDE_ASYNC_AGENT_STALL_TIMEOUT_MS
 
-# Ignore model slots inherited from another Claude launcher. The selected
-# compatibility ID seeds every slot; the Sonnet slot, which CC's auto-mode
-# permission judge resolves through, is pinned to the cache-honoring
-# classifier below once the catalog confirms this gateway serves it.
-# /model stays fully live: the whole compatibility catalog is offered.
+# Ignore model slots, the judge pin, and an effort level inherited from another
+# Claude launcher; an inherited CLAUDE_CODE_EFFORT_LEVEL would silently override
+# /effort and this launcher's remembered effortLevel. The selected compatibility
+# ID seeds every slot, so `sonnet`-declared subagents and the `sonnet` alias run
+# on it too. /model stays fully live: the whole compatibility catalog is offered.
 unset ANTHROPIC_DEFAULT_MODEL ANTHROPIC_DEFAULT_FABLE_MODEL
 unset ANTHROPIC_DEFAULT_HAIKU_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL
 unset ANTHROPIC_DEFAULT_OPUS_MODEL ANTHROPIC_SMALL_FAST_MODEL
-# Auto-mode permission judge (SONNET slot): z-ai/glm-5.3-flash (OpenRouter,
-# Anthropic-protocol) honors the judge's cache_control:ephemeral system block,
-# so repeat judge calls read the ~30k-token prefix from cache ($0.015/M vs
-# $0.075/M input). Claude Code vets the Sonnet-slot pin against
-# availableModels, so the classifier's canonical id also joins that
-# allowlist; a gateway without the alias keeps the judge on the startup
-# model.
+unset CLAUDE_CODE_AUTO_MODE_MODEL CLAUDE_CODE_EFFORT_LEVEL
+# Auto-mode permission judge: z-ai/glm-5.3-flash (OpenRouter, Anthropic-protocol)
+# honors the judge's cache_control:ephemeral system block, so repeat judge calls
+# read the ~30k-token prefix from cache ($0.015/M vs $0.075/M input). It is pinned
+# through CLAUDE_CODE_AUTO_MODE_MODEL, Claude Code's own judge override, which it
+# vets against availableModels, so the classifier's canonical id also joins that
+# allowlist. The catalog check below is the only guard that keeps the judge on the
+# startup model: a gateway without the alias leaves the variable unset. Unlike the
+# Sonnet-slot default, the env pin has no runtime fallback, so a classifier that
+# errors mid-session is not swapped for the main model on its own.
 classifier_model="${CLAUDE_LLM_CLASSIFIER_MODEL:-z-ai/glm-5.3-flash}"
 
 # Credentials are selective: existing Anthropic credentials, an optional
@@ -385,13 +396,37 @@ if [ "$auto_compact_tokens" -lt 100000 ]; then
   die 65 "Claude Code ignores compact windows below 100000; refusing an unsafe launch"
 fi
 unset DISABLE_COMPACT DISABLE_AUTO_COMPACT CLAUDE_AUTOCOMPACT_PCT_OVERRIDE
+
+export ANTHROPIC_MODEL="$selected_id"
+export ANTHROPIC_DEFAULT_MODEL="$selected_id"
+export ANTHROPIC_DEFAULT_FABLE_MODEL="$selected_id"
+export ANTHROPIC_DEFAULT_HAIKU_MODEL="$selected_id"
+export ANTHROPIC_DEFAULT_SONNET_MODEL="$selected_id"
+export ANTHROPIC_DEFAULT_OPUS_MODEL="$selected_id"
+export ANTHROPIC_SMALL_FAST_MODEL="$selected_id"
+# inherit follows the live main-loop model, so default subagents track a /model
+# pick; a concrete id would freeze them on the launch model.
+export CLAUDE_CODE_SUBAGENT_MODEL=inherit
+[ -z "$classifier_model" ] || export CLAUDE_CODE_AUTO_MODE_MODEL="$classifier_model"
+
+# Settings-file env outranks process env, so the routing, model, and timeout
+# values are restated in the inline settings, which outrank user and project
+# settings; the exports above still serve the launcher's own catalog and usage
+# reads. ANTHROPIC_CUSTOM_HEADERS stays process-only: a caller-added header may
+# carry a secret, and inline settings are visible in argv.
 settings=$(jq -cn \
   --argjson rows "$rows" \
   --arg classifier "$classifier_model" \
   --arg key_helper "$key_helper" \
   --arg max_context "$max_context_tokens" \
   --arg auto_compact "$auto_compact_tokens" \
-  --arg max_output "$output_tokens" '{
+  --arg max_output "$output_tokens" \
+  --arg base_url "$ANTHROPIC_BASE_URL" \
+  --arg model "$selected_id" \
+  --arg api_timeout "$API_TIMEOUT_MS" \
+  --arg force_idle_timeout "$API_FORCE_IDLE_TIMEOUT" \
+  --arg stream_idle_timeout "$CLAUDE_STREAM_IDLE_TIMEOUT_MS" \
+  --arg agent_stall_timeout "$CLAUDE_ASYNC_AGENT_STALL_TIMEOUT_MS" '{
     autoCompactEnabled: true,
     availableModels: ((($rows | map(.id)) + [$classifier]) | map(select(length > 0)) | unique),
     enforceAvailableModels: true,
@@ -401,18 +436,25 @@ settings=$(jq -cn \
       CLAUDE_CODE_MAX_OUTPUT_TOKENS: $max_output,
       DISABLE_COMPACT: "",
       DISABLE_AUTO_COMPACT: "",
-      CLAUDE_AUTOCOMPACT_PCT_OVERRIDE: ""
+      CLAUDE_AUTOCOMPACT_PCT_OVERRIDE: "",
+      ANTHROPIC_BASE_URL: $base_url,
+      CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY: "1",
+      CLAUDE_CODE_DISABLE_LEGACY_MODEL_REMAP: "1",
+      ANTHROPIC_MODEL: $model,
+      ANTHROPIC_DEFAULT_MODEL: $model,
+      ANTHROPIC_DEFAULT_FABLE_MODEL: $model,
+      ANTHROPIC_DEFAULT_HAIKU_MODEL: $model,
+      ANTHROPIC_DEFAULT_SONNET_MODEL: $model,
+      ANTHROPIC_DEFAULT_OPUS_MODEL: $model,
+      ANTHROPIC_SMALL_FAST_MODEL: $model,
+      CLAUDE_CODE_SUBAGENT_MODEL: "inherit",
+      CLAUDE_CODE_AUTO_MODE_MODEL: $classifier,
+      API_TIMEOUT_MS: $api_timeout,
+      API_FORCE_IDLE_TIMEOUT: $force_idle_timeout,
+      CLAUDE_STREAM_IDLE_TIMEOUT_MS: $stream_idle_timeout,
+      CLAUDE_ASYNC_AGENT_STALL_TIMEOUT_MS: $agent_stall_timeout
     }
   } + (if $key_helper == "" then {} else {apiKeyHelper: $key_helper} end)')
-
-export ANTHROPIC_MODEL="$selected_id"
-export ANTHROPIC_DEFAULT_MODEL="$selected_id"
-export ANTHROPIC_DEFAULT_FABLE_MODEL="$selected_id"
-export ANTHROPIC_DEFAULT_HAIKU_MODEL="$selected_id"
-export ANTHROPIC_DEFAULT_SONNET_MODEL="${classifier_model:-$selected_id}"
-export ANTHROPIC_DEFAULT_OPUS_MODEL="$selected_id"
-export ANTHROPIC_SMALL_FAST_MODEL="$selected_id"
-export CLAUDE_CODE_SUBAGENT_MODEL="$selected_id"
 
 # Keep the wrapper alive when the foreground Claude process receives terminal
 # interruption, so the authoritative gateway session ledger is still printed.
