@@ -56,7 +56,25 @@ if [ "${CLAUDE_CONFIG_DIR:-}" != "$launcher_config_dir" ]; then
       history.jsonl | CLAUDE.md) [ -f "$shared_path" ] ;;
       *) [ -d "$shared_path" ] ;;
     esac || die 73 "shared state has the wrong type: $shared_path"
-    link_shared_entry "$shared_path" "$launcher_config_dir/$shared_entry" || exit 73
+    private_path="$launcher_config_dir/$shared_entry"
+    # Earlier launcher versions kept the peer registry private, so a real sessions dir
+    # may already sit here. Its files are pid-keyed (<pid>.json, <pid>.<hash>.key) and
+    # meaningless once that pid exits; dead entries go, and while a session that started
+    # under the old layout still runs, linking waits for a later launch.
+    if [ "$shared_entry" = sessions ] && [ -d "$private_path" ] && [ ! -L "$private_path" ]; then
+      for registry_file in "$private_path"/*.json "$private_path"/*.key; do
+        [ -f "$registry_file" ] || continue
+        registry_pid=${registry_file##*/}
+        registry_pid=${registry_pid%%.*}
+        kill -0 "$registry_pid" 2>/dev/null || rm -f "$registry_file" ||
+          die 73 "could not remove stale peer registry entry $registry_file"
+      done
+      if ! rmdir "$private_path" 2>/dev/null; then
+        say "$private_path still holds a live session's registry; sessions is not shared this launch"
+        continue
+      fi
+    fi
+    link_shared_entry "$shared_path" "$private_path" || exit 73
   done
   # Custom keybindings are linked only when the user has some: an empty file is not
   # valid keybindings JSON, so the launcher never creates one.
