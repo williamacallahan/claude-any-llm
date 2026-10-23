@@ -91,8 +91,10 @@ if [ "${CLAUDE_CONFIG_DIR:-}" != "$launcher_config_dir" ]; then
   link_shared_entry "$shared_global_config" "$launcher_config_dir/.claude.json" || exit 73
 
   # settings.json is private, rebuilt every launch as the shared settings minus their
-  # model and effort, plus this launcher's own last /model and /effort picks, so shared
-  # hooks, permissions, plugins, env, and cleanupPeriodDays changes always apply.
+  # model and effort, plus this launcher's own last /model pick, top-level effortLevel,
+  # and modelSettings entries (where /effort saves per-model effort; this launcher's
+  # entry wins per model id), so shared hooks, permissions, plugins, env, and
+  # cleanupPeriodDays changes always apply.
   # Tradeoff: any other setting a launcher session writes is replaced next launch.
   shared_settings="$shared_config_dir/settings.json"
   [ -f "$shared_settings" ] || shared_settings=/dev/null
@@ -105,6 +107,9 @@ if [ "${CLAUDE_CONFIG_DIR:-}" != "$launcher_config_dir" ]; then
     | if ($base | type) != "object" or ($own | type) != "object" then error("not an object") else . end
     | ($base | del(.model, .effortLevel))
       + ($own | with_entries(select(.key == "model" or .key == "effortLevel")))
+      + (if ($own | has("modelSettings"))
+         then {modelSettings: (($base.modelSettings // {}) + $own.modelSettings)}
+         else {} end)
   ' > "$settings_tmp" 2>/dev/null; then
     mv "$settings_tmp" "$launcher_settings" || { rm -f "$settings_tmp"; exit 73; }
   else
