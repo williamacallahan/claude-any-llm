@@ -17,7 +17,7 @@ curl -fsSL -o ~/.local/bin/claude-any-llm \
 chmod +x ~/.local/bin/claude-any-llm
 ```
 
-The default model is `qwen3.8-flash-long-context` through the development Squirrel gateway. The launcher:
+The default model is `deepseek/deepseek-v4.1-flash` through the development Squirrel gateway: DeepSeek V4.1 Flash on OpenRouter, sent with the gateway's OpenRouter sub-provider order for that model. The launcher:
 
 - reads the live gateway compatibility catalog instead of restating model metadata;
 - applies the published context and output limits to Claude Code;

@@ -3,7 +3,7 @@
 
 name=$(basename "$0")
 base_url="${ANTHROPIC_BASE_URL:-https://dev.api.llm-gateway.iocloudhost.net}"
-default_model=qwen3.8-flash-long-context
+default_model=deepseek/deepseek-v4.1-flash
 requested_model="${ANTHROPIC_MODEL:-}"
 requested_from_state=false
 key_secret=LLM_GATEWAY_DEV_API_KEY
