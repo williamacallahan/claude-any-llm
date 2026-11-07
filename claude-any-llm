@@ -541,8 +541,10 @@ if [ -n "$usage_json" ]; then
     end
   ' 2>/dev/null) || usage_summary=
 fi
+# stderr, like every other launcher message: with -p --output-format json, stdout
+# is the machine-read Claude result, and a trailing text line breaks its parse.
 if [ -n "$usage_summary" ]; then
-  printf '%s\n' "$usage_summary"
+  printf '%s\n' "$usage_summary" >&2
 else
   say "gateway usage summary unavailable"
 fi
