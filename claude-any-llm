@@ -7,7 +7,7 @@ default_model=deepseek/deepseek-v4.1-flash
 requested_model="${ANTHROPIC_MODEL:-}"
 requested_from_state=false
 key_secret=LLM_GATEWAY_DEV_API_KEY
-key_helper="doppler secrets get $key_secret -p personal -c dev --plain"
+key_helper="doppler secrets get $key_secret -p personal -c dev --plain --scope $HOME"
 say() { printf '%s: %s\n' "$name" "$*" >&2; }
 die() { exit_status=$1; shift; say "$@"; exit "$exit_status"; }
 
@@ -214,6 +214,8 @@ unset ANTHROPIC_DEFAULT_MODEL ANTHROPIC_DEFAULT_FABLE_MODEL
 unset ANTHROPIC_DEFAULT_HAIKU_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL
 unset ANTHROPIC_DEFAULT_OPUS_MODEL ANTHROPIC_SMALL_FAST_MODEL
 unset CLAUDE_CODE_AUTO_MODE_MODEL CLAUDE_CODE_EFFORT_LEVEL
+# A parent launcher session also exports these sub-agent effort and model pins.
+unset CLAUDE_CODE_SUBAGENT_EFFORT CLAUDE_CODE_SUBAGENT_MODEL_FORCE
 # Auto-mode permission judge: z-ai/glm-5.3-flash (OpenRouter, Anthropic-protocol)
 # honors the judge's cache_control:ephemeral system block, so repeat judge calls
 # read the ~30k-token prefix from cache ($0.015/M vs $0.075/M input). It is pinned
