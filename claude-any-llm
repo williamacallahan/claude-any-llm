@@ -477,7 +477,8 @@ settings=$(jq -cn \
       API_TIMEOUT_MS: $api_timeout,
       API_FORCE_IDLE_TIMEOUT: $force_idle_timeout,
       CLAUDE_STREAM_IDLE_TIMEOUT_MS: $stream_idle_timeout,
-      CLAUDE_ASYNC_AGENT_STALL_TIMEOUT_MS: $agent_stall_timeout
+      CLAUDE_ASYNC_AGENT_STALL_TIMEOUT_MS: $agent_stall_timeout,
+      CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK: "1"
     }
   } + (if $key_helper == "" then {} else {apiKeyHelper: $key_helper} end)')
 
